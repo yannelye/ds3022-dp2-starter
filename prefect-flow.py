@@ -18,6 +18,12 @@ tasks as your design needs, and keep your DAG sketch in step with them.
 Use Prefect's logger (get_run_logger) for logging. Never hard-code your
 computing ID or the endpoint: read them from the environment (.env).
 """
+
+"""DS 3022 Data Project 2: Prefect flow.
+
+Checkpoint A: Populate and monitor the SQS queue.
+"""
+
 import os
 import time
 
@@ -32,63 +38,117 @@ UVA_ID = os.environ["UVA_ID"]
 SCATTER_URL = f"http://127.0.0.1:{os.environ.get('SCATTER_PORT', '8000')}/api/scatter/{UVA_ID}"
 DUCKDB_PATH = os.environ.get("DP2_DUCKDB", "dp2.duckdb")
 
-sqs = boto3.client("sqs")  # the endpoint comes from AWS_ENDPOINT_URL_SQS
+sqs = boto3.client("sqs")
 
 
+# CHECKPOINT A: Populate queue
 @task
 def populate_queue() -> str:
-    """POST to the scatter API and return your queue URL."""
+    """POST to the scatter API and return the queue URL."""
     logger = get_run_logger()
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+
+    response = requests.post(SCATTER_URL, timeout=30)
+    response.raise_for_status()
+
+    payload = response.json()
+    queue_url = payload["sqs_url"]
+
+    logger.info("Queue populated with %s messages", payload["messages"])
+    logger.info("Queue URL: %s", queue_url)
+
+    return queue_url
 
 
+# CHECKPOINT A: Get queue counters
 def get_counts(queue_url: str) -> dict:
-    """Plain helper (not a task): return the three ApproximateNumberOf... counters as integers."""
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+    """Return the three SQS queue counters as integers."""
+
+    attributes = [
+        "ApproximateNumberOfMessages",
+        "ApproximateNumberOfMessagesNotVisible",
+        "ApproximateNumberOfMessagesDelayed",
+    ]
+
+    response = sqs.get_queue_attributes(
+        QueueUrl=queue_url,
+        AttributeNames=attributes,
+    )
+
+    counts = response["Attributes"]
+
+    return {
+        "visible": int(counts.get("ApproximateNumberOfMessages", 0)),
+        "not_visible": int(counts.get("ApproximateNumberOfMessagesNotVisible", 0)),
+        "delayed": int(counts.get("ApproximateNumberOfMessagesDelayed", 0)),
+    }
 
 
+# CHECKPOINT A: Monitor queue
 @task
 def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dict:
-    """Log the three counters every poll_s seconds until nothing is delayed; raise after timeout_s."""
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+    """Monitor queue counters until all messages are no longer delayed."""
+    logger = get_run_logger()
+
+    start_time = time.monotonic()
+
+    while time.monotonic() - start_time < timeout_s:
+        counts = get_counts(queue_url)
+
+        logger.info(
+            "Visible: %s | Not visible: %s | Delayed: %s",
+            counts["visible"],
+            counts["not_visible"],
+            counts["delayed"],
+        )
+
+        if counts["delayed"] == 0:
+            logger.info("All messages are available!")
+            return counts
+
+        time.sleep(poll_s)
+
+    raise TimeoutError("Queue monitoring timed out.")
 
 
+# CHECKPOINT B: Collect messages
 @task
 def collect_messages(queue_url: str, expected: int = 21) -> int:
-    """Receive, land in DuckDB, then delete. Return how many fragments are stored."""
-    # TODO (Checkpoint B): MessageAttributeNames=["All"] and resp.get("Messages", [])
-    raise NotImplementedError
+    """Receive, store in DuckDB, then delete messages."""
+    raise NotImplementedError("Complete in Checkpoint B")
 
 
+# CHECKPOINT C: Run dbt
 @task
 def dbt_build() -> None:
-    """Run `dbt build --project-dir dbt --profiles-dir dbt`; raise if anything fails."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    """Run dbt models and tests."""
+    raise NotImplementedError("Complete in Checkpoint C")
 
 
+# CHECKPOINT C: Read phrase
 @task
 def read_phrase() -> str:
-    """Read the phrase from the dbt mart model in DuckDB."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    """Read assembled phrase from DuckDB."""
+    raise NotImplementedError("Complete in Checkpoint C")
 
 
+# CHECKPOINT D: Submit solution
 @task
 def submit_solution(phrase: str, platform: str = "prefect") -> int:
-    """Send to dp2-submit with uvaid / phrase / platform attributes. Return the HTTP status code."""
-    # TODO (Checkpoint D)
-    raise NotImplementedError
+    """Submit the completed phrase."""
+    raise NotImplementedError("Complete in Checkpoint D")
 
 
+# MAIN PREFECT FLOW
 @flow(name="dp2-pipeline", log_prints=True)
 def dp2_pipeline():
     queue_url = populate_queue()
     monitor_queue(queue_url)
-    # TODO (Lesson 10): collect_messages -> dbt_build -> read_phrase -> submit_solution
+
+    # Remaining steps will be added in later checkpoints:
+    # collect_messages(queue_url)
+    # dbt_build()
+    # phrase = read_phrase()
+    # submit_solution(phrase)
 
 
 if __name__ == "__main__":
