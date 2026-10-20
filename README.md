@@ -1,161 +1,206 @@
-# DS 3022 Data Project 2 (Fall 2026): The SQS Puzzle
+# DS 3022 Data Project 2: The SQS Puzzle
 
-This data project is a puzzle. Your goal is to put the pieces back together in the right order.
+## Project Overview
 
-You will write a **Prefect** data pipeline that retrieves 21 messages from an SQS queue, parses their contents, and reassembles a complete phrase from the fragments, one word per message. Your pipeline can run a single time to produce a complete result, or it can run on a schedule. Design your workflow however you see fit. You can run it as many times as you like while testing.
+For this project, I built a data pipeline using Prefect, Amazon SQS (through a local Moto emulator), DuckDB and dbt. The goal was to collect 21 message fragments, arrange them in the correct order and submit the completed phrase.
 
-> Adapted from Neal Magee's Fall 2025 Data Project 2 (UVA). The puzzle is the same. Two things are new this year:
-> 1. **The queue runs on your laptop.** A free SQS emulator replaces AWS, so you need no AWS account or credentials. Your code is still ordinary `boto3`: one environment variable (`AWS_ENDPOINT_URL_SQS`) decides whether it talks to your laptop or to real AWS.
-> 2. **dbt is the quality gate.** Fragments are landed in DuckDB, and a dbt model reassembles the phrase. dbt tests must pass before your flow is allowed to submit.
+The pipeline runs automatically, from creating the SQS queue to submitting the final phrase. I also tested the pipeline under normal delays and chaos mode to make sure it could handle unexpected messages.
 
-**Due:** Monday 19 October 2026, **23:59** (Lesson 11 that afternoon is a working session: evidence run, chaos round and independent build time with instructor help). **Weight:** 20%.
+## Technologies Used
 
-Before anything else, follow **[SETUP.md](SETUP.md)** until `python kit/smoke_test.py` prints `Emulator OK`. SETUP.md also explains the four terminals you keep open while you work.
-Work through **[CHECKPOINTS.md](CHECKPOINTS.md)**, check your work against **[RUBRIC.md](RUBRIC.md)**, and keep **[PROGRESS.md](PROGRESS.md)** up to date.
+- **Python and Prefect:** Workflow orchestration and task logging
+- **Moto and boto3:** Local SQS emulator and message processing
+- **DuckDB:** Storage for collected message fragments
+- **dbt:** Data cleaning, quality tests and phrase assembly
+- **Git and GitHub:** Version control
 
-## Architecture
+## Setup and Running the Pipeline
 
-```
-POST /api/scatter/<UVA_ID>          (kit/scatter_api.py, your laptop)
-        |
-        v
-SQS queue <UVA_ID>  -- 21 messages, each delayed 30-900 s --
-        |
-        v
-Prefect flow  (prefect-flow.py)
-   monitor counters -> receive -> land in DuckDB raw.fragments -> delete
-        |
-        v
-dbt build  (dbt/)
-   stg_fragments (typed, de-duplicated) -> tests -> assembled_phrase
-        |
-        v
-send_message to queue dp2-submit  ->  python kit/check_submission.py  ->  receipt code
+I used four terminals in VS Code.
+
+First, I created and activated the Python virtual environment and installed the project dependencies following `SETUP.md`.
+
+I configured `.env` with my UVA computing ID and the local SQS emulator settings.
+
+The terminals run the following commands:
+
+**Terminal 1: Prefect server**
+
+```bash
+prefect server start
 ```
 
-## Task 1: Populate your SQS queue
+**Terminal 2: Moto SQS emulator**
 
-Make an HTTP `POST` request to the scatter API with your UVA computing ID (the scatter API must be running, see SETUP.md):
-
-```
-http://127.0.0.1:8000/api/scatter/<UVA_ID>
+```bash
+moto_server -p 9324
 ```
 
-```python
-import requests
+**Terminal 3: Scatter API**
 
-url = "http://127.0.0.1:8000/api/scatter/mst3k"
-payload = requests.post(url).json()
+```bash
+python kit/scatter_api.py
 ```
 
-```python
-import httpx
+**Terminal 4: Pipeline**
 
-url = "http://127.0.0.1:8000/api/scatter/mst3k"
-payload = httpx.post(url).json()
+```bash
+python prefect-flow.py
 ```
 
-The response gives you your queue URL:
+Before running the pipeline, I can verify the local services with:
 
-```
->>> payload
-{'hello': 'mst3k', 'sqs_url': 'http://127.0.0.1:9324/123456789012/mst3k', 'messages': 21, 'mode': 'fast (5-60s delays)'}
-```
-
-Your request sends exactly **21** messages to your queue, each with a random `DelaySeconds` between **30 and 900 seconds** (5 to 60 seconds while `DP2_FAST=1`, for development). **Keep these delays in mind as your pipeline proceeds to the next task.**
-
-**NOTE:** Do not repeat this POST if your pipeline runs more than once (for example on a schedule) or inside a retry loop. Each POST empties your queue and sends all 21 messages again.
-
-## Task 2: Monitor your queue, then collect, land and delete
-
-Track how many messages are waiting with `get_queue_attributes()`. Three values count messages, and together they make up the total:
-
-- `ApproximateNumberOfMessages` (visible, ready to receive)
-- `ApproximateNumberOfMessagesNotVisible` (received by someone, not yet deleted)
-- `ApproximateNumberOfMessagesDelayed` (still hidden by their delay)
-
-Decide on a strategy for how and when to pick up messages, explain it in your README, and code it.
-
-Each message has a `Body` containing the same meaningless word. The meaningful content is in `MessageAttributes`. Ask for it explicitly with `MessageAttributeNames=["All"]`, then read each attribute's `StringValue`:
-
-```python
-msg = resp["Messages"][0]
-order_no = msg["MessageAttributes"]["order_no"]["StringValue"]   # a string, not an int
-word     = msg["MessageAttributes"]["word"]["StringValue"]
+```bash
+python kit/smoke_test.py
 ```
 
-Requirements:
+The pipeline can be monitored through the Prefect dashboard at `http://127.0.0.1:4200`.
 
-- **Land every fragment in DuckDB** (default file `dp2.duckdb`, table `raw.fragments` with at least `order_no`, `word`, `received_at`) **before** you delete its message.
-- Delete each message with its `ReceiptHandle` after storing it. Your pipeline must receive, store and delete **all** messages. Leave no "dangling" messages behind.
-- Handle empty or delayed responses gracefully. When nothing is visible, `receive_message` returns a response **without** a `Messages` key; your pipeline must not crash on it.
-- Use a timeout so the pipeline fails clearly, rather than hanging forever, if fragments never arrive.
+For faster testing, I used `DP2_FAST=1`. For the required full-delay evidence run, I restarted the Scatter API with `DP2_FAST=0`.
 
-## Task 3: Reassemble with dbt, then submit
+## Pipeline Design
 
-Build the phrase with dbt inside `dbt/` (the project, profile and source are already set up):
+My Prefect pipeline follows six main tasks:
 
-- `models/staging/stg_fragments.sql`: cast `order_no` to an integer and clean `word`. Make this robust to a fragment being stored twice.
-- `models/staging/schema.yml`: generic tests (`not_null`, `unique`, ...) on its columns.
-- `tests/`: at least one singular test that fails unless there are exactly 21 fragments with no gaps in the order numbers.
-- `models/marts/assembled_phrase.sql`: one row containing the phrase in order.
+1. **populate_queue:** Sends a POST request to the Scatter API to generate the messages.
+2. **monitor_queue:** Checks the queue until all delayed messages become available.
+3. **collect_messages:** Receives, validates and stores the fragments in DuckDB before deleting their SQS messages.
+4. **dbt_build:** Runs the dbt models and quality tests.
+5. **read_phrase:** Retrieves the assembled phrase from DuckDB.
+6. **submit_solution:** Sends the completed phrase to the `dp2-submit` queue.
 
-Your flow runs `dbt build --project-dir dbt --profiles-dir dbt` (or `dbtRunner` from `dbt.cli.main`) and **must not submit if dbt fails**.
+The pipeline diagram is saved in `docs/dag.jpg`.
 
-Example of ordering:
+## Polling Strategy
 
-```
-order_no   word
---------   -----
-3          brown
-2          quick
-4          fox.
-1          The
-```
+I used a polling strategy because SQS messages do not all become available at the same time.
 
-gives "The quick brown fox."
+The `monitor_queue` task checks three queue counters: visible, not visible and delayed. It waits until the delayed count reaches zero before moving to message collection.
 
-Submit your phrase as a message to the separate queue **`dp2-submit`**, with your computing ID and the platform used (`"prefect"`) as message attributes:
+The `collect_messages` task uses SQS long polling with `WaitTimeSeconds=20` and `MessageAttributeNames=["All"]`. It handles empty responses using `.get("Messages", [])` and continues until the expected unique fragments have been collected and the queue is empty.
 
-```python
-def send_solution(uvaid, phrase, platform):
-    url = sqs.get_queue_url(QueueName="dp2-submit")["QueueUrl"]
-    response = sqs.send_message(
-        QueueUrl=url,
-        MessageBody="dp2 solution",
-        MessageAttributes={
-            "uvaid":    {"DataType": "String", "StringValue": uvaid},
-            "phrase":   {"DataType": "String", "StringValue": phrase},
-            "platform": {"DataType": "String", "StringValue": platform},
-        },
-    )
-    ...
-```
+I chose this approach because it avoids constantly requesting messages when none are available. It also allows the pipeline to handle different message arrival times without manually checking the queue.
 
-Check and log that the response has HTTP status `200`. Then run:
+A timeout prevents the pipeline from waiting indefinitely if the expected fragments never arrive.
 
-```
+## DuckDB Storage and dbt Quality Gate
+
+The pipeline stores fragments in `raw.fragments` in DuckDB. Each fragment has an order number and a word.
+
+The dbt staging model, `stg_fragments.sql`, converts order numbers to integers, cleans the words and removes exact duplicates.
+
+I created generic tests to check for missing values and duplicate order numbers. I also created a singular test that requires exactly 21 fragments with order numbers from 1 through 21.
+
+The `assembled_phrase.sql` model combines the words using their order numbers.
+
+I tested the quality gate by intentionally introducing errors:
+
+- **Missing fragment:** I removed a row, causing the 21-fragment test to fail.
+- **Conflicting duplicate:** I inserted another word with an existing order number, causing the uniqueness test to fail.
+
+In both cases, dbt reported errors and skipped the final phrase model. After restoring the original data, all tests passed again.
+
+The Prefect `dbt_build` task raises an error if dbt fails, preventing the pipeline from submitting an invalid phrase.
+
+### Quality Gate Evidence
+
+**Passing dbt tests:**
+
+![Passing dbt tests](docs/checkpoint-c-dbt-pass.png)
+
+**Failing dbt test after removing a fragment:**
+
+![Missing fragment test failure](docs/checkpoint-c-dbt-fail.png)
+
+**Failing dbt test after inserting a conflicting duplicate:**
+
+![Duplicate fragment test failure](docs/checkpoint-c-duplicate-fail.png)
+
+## Full-Delay Evidence Run
+
+I completed the required full-delay run with `DP2_FAST=0` and `DP2_CHAOS=0`.
+
+The Scatter API used normal message delays of 30–900 seconds.
+
+My Prefect flow, `silver-boa`, completed successfully in approximately 13 minutes and 53 seconds.
+
+The dbt build passed all six operations with zero errors, and the submission returned HTTP status 200.
+
+I verified the result using:
+
+```bash
 python kit/check_submission.py
 ```
 
-and paste the **receipt code** it prints into your README.
+The submission passed verification.
 
-You may observe and rerun your pipeline as often as you like, but in the end your code must fetch, store, test, reassemble and submit without human intervention. You may not receive messages or sort fragments by hand.
+![Full-delay Prefect evidence](docs/checkpoint-f-full-delay.png)
 
-## Notes and submission
+## Chaos Round
 
-1. Fork the assignment repository and push your work to your fork.
-2. Your Prefect flow lives in `prefect-flow.py`. Secondary flows (subflows) are allowed.
-3. Use Prefect's built-in logging. Do not commit log files.
-4. Do not commit data, `.duckdb` files, `dbt/target/` or `.env` (the provided `.gitignore` handles this).
-5. Do not edit the files in `kit/`: they are the same for everyone and are used to check your submission.
-6. Your **README must include**: how to set up and run your pipeline; your polling strategy and why; how your dbt tests protect the result (with a screenshot of a test failing on purpose and then passing); a Prefect dashboard screenshot of one **full-delay run** (`DP2_FAST=0`); your receipt code; and a "Chaos round" section (Lesson 11).
-7. Submit the repository link and your self-assessed **[RUBRIC.md](RUBRIC.md)**. Your README is where you explain and defend your design (25% of the grade).
+For the chaos round, I enabled `DP2_CHAOS=1` and `DP2_FAST=1`.
 
-## Reference
+Chaos mode introduces 24 messages: 21 valid fragments, two duplicate messages and one malformed message missing a required attribute.
 
-- [Working with SQS: practical examples (Neal Magee)](https://github.com/nmagee/learn-sqs)
-- [boto3 SQS client documentation](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sqs.html)
-- [Prefect documentation](https://docs.prefect.io/v3/get-started)
-- [dbt-duckdb adapter](https://github.com/duckdb/dbt-duckdb) and [dbt data tests](https://docs.getdbt.com/docs/build/data-tests)
-- [Moto server mode](https://docs.getmoto.org/en/latest/docs/server_mode.html), [ElasticMQ](https://github.com/softwaremill/elasticmq)
+### What Broke and Why
+
+My original `collect_messages` function assumed that every received message contained valid `order_no` and `word` attributes. A malformed message could cause the function to fail when accessing an attribute that was missing.
+
+The original function also counted received messages rather than unique fragments. This could cause duplicates to be counted toward the expected 21 fragments.
+
+### How I Fixed It
+
+I updated `collect_messages` to validate message attributes before inserting them into DuckDB.
+
+The function now:
+
+- Skips malformed messages and logs a warning.
+- Tracks previously collected order numbers to avoid counting duplicates.
+- Stores valid fragments before deleting their messages.
+- Continues processing until all 21 unique fragments are collected and the queue counters reach zero.
+- Raises an error if the expected fragments are not collected before the timeout.
+
+### Chaos Test Results
+
+I completed two consecutive chaos-mode runs without changing the configuration between them.
+
+| Run | Prefect Flow | dbt | Submission |
+|---|---|---|---|
+| 1 | `lucky-wapiti` | PASS=6, ERROR=0 | PASS |
+| 2 | `naughty-sponge` | PASS=6, ERROR=0 | PASS |
+
+Both runs completed successfully and returned HTTP status 200. The submission checker confirmed the correct phrase in both runs.
+
+**Chaos handling evidence:**
+
+![Chaos handling logs](docs/checkpoint-f-chaos-handling.png)
+
+**Chaos Run 1:**
+
+![First completed chaos run](docs/checkpoint-f-chaos-run1.png)
+
+![First chaos verification](docs/checkpoint-f-chaos-run1-pass.png)
+
+**Chaos Run 2:**
+
+![Second completed chaos run](docs/checkpoint-f-chaos-run2.png)
+
+![Second chaos verification](docs/checkpoint-f-chaos-run2-pass.png)
+
+## Submission Verification
+
+My completed pipeline successfully submitted the assembled phrase to the local `dp2-submit` queue.
+
+- **UVA computing ID:** usw5zk
+- **Platform:** prefect
+- **HTTP status:** 200
+- **Verification result:** PASS
+- **Receipt code:** `D2C5AE1A74`
+
+The receipt was verified using `python kit/check_submission.py`.
+
+## Conclusion
+
+This project helped me understand how to build a data pipeline that handles delayed and unexpected messages while checking data quality before submission.
+
+The most important improvement was making the collection task more reliable. By validating messages, avoiding duplicate fragments and checking that the queue was empty, I was able to complete the normal and chaos-mode runs successfully.

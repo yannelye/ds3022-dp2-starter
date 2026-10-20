@@ -1,0 +1,18 @@
+
+version: 2
+
+models:
+  - name: stg_fragments
+    description: Cleaned and deduplicated SQS fragments.
+
+    columns:
+      - name: order_no
+        description: Position of each word in the phrase.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: word
+        description: Cleaned word from the SQS message.
+        data_tests:
+          - not_null
